@@ -4,13 +4,13 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import path from "path";
 
-const execPromise = promisify(exec);
+// 将回调风格的 execFile 包装成 Promise，方便在 async/await 中使用。
+const execFilePromise = promisify(execFile);
 
-// 创建 MCP 服务实例
 const server = new Server(
   {
     name: "sub-font",
@@ -23,15 +23,12 @@ const server = new Server(
   }
 );
 
-/**
- * 定义工具列表
- */
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+const handleListTools = async () => {
   return {
     tools: [
       {
         name: "sub-font",
-        description: "提取字体文件的子集。AI 会自动从上下文中提取需要保留的文字。",
+        description: "提取字体文件子集，仅保留指定文字。",
         inputSchema: {
           type: "object",
           properties: {
@@ -54,57 +51,89 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
     ],
   };
-});
+};
 
-/**
- * 处理工具调用逻辑
- */
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+// 统一处理并校验工具入参，避免在业务流程中重复判断。
+const normalizeArgs = (args = {}) => {
+  const inputPath =
+    typeof args.inputPath === "string" ? args.inputPath.trim() : "";
+  const text = typeof args.text === "string" ? args.text : "";
+  const outputName =
+    typeof args.outputName === "string" && args.outputName.trim()
+      ? args.outputName.trim()
+      : "subset.otf";
+
+  if (!inputPath) {
+    throw new Error("参数 inputPath 不能为空");
+  }
+
+  if (!text) {
+    throw new Error("参数 text 不能为空");
+  }
+
+  return { inputPath, text, outputName };
+};
+
+// 统一成功返回结构，便于调用方稳定解析结果。
+const buildSuccessResult = (outputPath, text) => {
+  return {
+    content: [
+      {
+        type: "text",
+        text: `字体子集生成成功\n文件路径: ${outputPath}\n包含文字: ${text}`,
+      },
+    ],
+  };
+};
+
+// 统一错误返回结构，并兼容 Error 与非 Error 异常对象。
+const buildErrorResult = (error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    content: [
+      {
+        type: "text",
+        text: `字体子集生成失败: ${message}`,
+      },
+    ],
+    isError: true,
+  };
+};
+
+const handleCallTool = async (request) => {
+  // 仅处理当前服务声明的 sub-font 工具。
   if (request.params.name === "sub-font") {
-    const { inputPath, text, outputName = "subset.otf" } = request.params.arguments;
-    
-    // 获取输出文件的绝对路径（默认放在原始文件同级目录）
-    const outputPath = path.join(path.dirname(inputPath), outputName);
-
     try {
-      // 执行 fonttools 命令
-      // --text 参数直接接收字符串，处理方便
-      const command = `fonttools subset "${inputPath}" --text="${text.replace(/"/g, '\\"')}" --output-file="${outputPath}"`;
-      
-      await execPromise(command);
+      const { inputPath, text, outputName } = normalizeArgs(request.params.arguments);
+      // 默认将输出文件落在源字体同级目录，便于定位产物。
+      const outputPath = path.join(path.dirname(inputPath), outputName);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `✅ 字体子集生成成功！\n文件路径: ${outputPath}\n包含文字: ${text}`,
-          },
-        ],
-      };
+      // 调用 fonttools subset 生成仅包含指定文字的字体文件。
+      await execFilePromise("fonttools", [
+        "subset",
+        inputPath,
+        `--text=${text}`,
+        `--output-file=${outputPath}`,
+      ]);
+
+      return buildSuccessResult(outputPath, text);
     } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `❌ 出错了: ${error.message}`,
-          },
-        ],
-        isError: true,
-      };
+      return buildErrorResult(error);
     }
   }
 
   throw new Error("Tool not found");
-});
+};
 
-/**
- * 启动服务
- */
-async function main() {
+server.setRequestHandler(ListToolsRequestSchema, handleListTools);
+server.setRequestHandler(CallToolRequestSchema, handleCallTool);
+
+// 通过 stdio 与 MCP Host 通信，适配本地工具链调用。
+const main = async () => {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Font Subsetter MCP Server running on stdio");
-}
+};
 
 main().catch((error) => {
   console.error("Fatal error:", error);
